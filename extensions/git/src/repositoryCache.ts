@@ -3,10 +3,25 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { LogOutputChannel, Memento, workspace } from 'vscode';
-import * as path from 'path';
+import { LogOutputChannel, Memento, Uri, workspace } from 'vscode';
 import { LRUCache } from './cache';
-import { Remote } from './api/git';
+import type { Remote, RepositoryAccessDetails } from './api/git';
+import { isDescendant } from './util';
+
+export interface RepositoryCacheInfo {
+	repositoryPath: string; // path of the local repository clone
+	workspacePath: string; // path of the workspace folder or workspace file
+	lastTouchedTime?: number; // timestamp when the repository was last touched
+}
+
+function isRepositoryCacheInfo(obj: unknown): obj is RepositoryCacheInfo {
+	if (!obj || typeof obj !== 'object') {
+		return false;
+	}
+	const rec = obj as Record<string, unknown>;
+	return typeof rec.workspacePath === 'string' && typeof rec.repositoryPath === 'string' &&
+		(rec.lastTouchedTime === undefined || typeof rec.lastTouchedTime === 'number');
+}
 
 export class RepositoryCache {
 
@@ -14,8 +29,44 @@ export class RepositoryCache {
 	private static readonly MAX_REPO_ENTRIES = 30; // Max repositories tracked
 	private static readonly MAX_FOLDER_ENTRIES = 10; // Max folders per repository
 
-	// Outer LRU: repoUrl -> inner LRU (folderPathOrWorkspaceFile -> true). Only keys matter.
-	private readonly lru = new LRUCache<string, LRUCache<string, true>>(RepositoryCache.MAX_REPO_ENTRIES);
+	private normalizeRepoUrl(url: string): string {
+		try {
+			const trimmed = url.trim();
+			return trimmed.replace(/(?:\.git)?\/*$/i, '');
+		} catch {
+			return url;
+		}
+	}
+
+	// Outer LRU: repoUrl -> inner LRU (folderPathOrWorkspaceFile -> RepositoryCacheInfo).
+	private readonly lru = new LRUCache<string, LRUCache<string, RepositoryCacheInfo>>(RepositoryCache.MAX_REPO_ENTRIES);
+
+	private _recentRepositories: Map<string, number> | undefined;
+
+	get recentRepositories(): Iterable<RepositoryAccessDetails> {
+		if (!this._recentRepositories) {
+			this._recentRepositories = new Map<string, number>();
+
+			for (const [_, inner] of this.lru) {
+				for (const [, repositoryDetails] of inner) {
+					if (!repositoryDetails.repositoryPath || !repositoryDetails.lastTouchedTime) {
+						continue;
+					}
+
+					// Check whether the repository exists with a more recent access time
+					const repositoryLastAccessTime = this._recentRepositories.get(repositoryDetails.repositoryPath);
+					if (repositoryLastAccessTime && repositoryDetails.lastTouchedTime <= repositoryLastAccessTime) {
+						continue;
+					}
+
+					this._recentRepositories.set(repositoryDetails.repositoryPath, repositoryDetails.lastTouchedTime);
+				}
+			}
+		}
+
+		return Array.from(this._recentRepositories.entries()).map(([rootPath, lastAccessTime]) =>
+			({ rootUri: Uri.file(rootPath), lastAccessTime } satisfies RepositoryAccessDetails));
+	}
 
 	constructor(public readonly _globalState: Memento, private readonly _logger: LogOutputChannel) {
 		this.load();
@@ -38,17 +89,22 @@ export class RepositoryCache {
 	 * @param rootPath Root path of the local repo clone.
 	 */
 	set(repoUrl: string, rootPath: string): void {
-		let foldersLru = this.lru.get(repoUrl);
+		const key = this.normalizeRepoUrl(repoUrl);
+		let foldersLru = this.lru.get(key);
 		if (!foldersLru) {
-			foldersLru = new LRUCache<string, true>(RepositoryCache.MAX_FOLDER_ENTRIES);
+			foldersLru = new LRUCache<string, RepositoryCacheInfo>(RepositoryCache.MAX_FOLDER_ENTRIES);
 		}
 		const folderPathOrWorkspaceFile: string | undefined = this._findWorkspaceForRepo(rootPath);
 		if (!folderPathOrWorkspaceFile) {
 			return;
 		}
 
-		foldersLru.set(folderPathOrWorkspaceFile, true); // touch entry
-		this.lru.set(repoUrl, foldersLru);
+		foldersLru.set(folderPathOrWorkspaceFile, {
+			repositoryPath: rootPath,
+			workspacePath: folderPathOrWorkspaceFile,
+			lastTouchedTime: Date.now()
+		}); // touch entry
+		this.lru.set(key, foldersLru);
 		this.save();
 	}
 
@@ -56,19 +112,13 @@ export class RepositoryCache {
 		// If the current workspace is a workspace file, use that. Otherwise, find the workspace folder that contains the rootUri
 		let folderPathOrWorkspaceFile: string | undefined;
 		try {
-			if (this._workspaceFile) {
+			if (this._workspaceFile && this._workspaceFile.scheme === 'file') {
 				folderPathOrWorkspaceFile = this._workspaceFile.fsPath;
 			} else if (this._workspaceFolders && this._workspaceFolders.length) {
 				const sorted = [...this._workspaceFolders].sort((a, b) => b.uri.fsPath.length - a.uri.fsPath.length);
 				for (const folder of sorted) {
 					const folderPath = folder.uri.fsPath;
-					const relToFolder = path.relative(folderPath, rootPath);
-					if (relToFolder === '' || (!relToFolder.startsWith('..') && !path.isAbsolute(relToFolder))) {
-						folderPathOrWorkspaceFile = folderPath;
-						break;
-					}
-					const relFromFolder = path.relative(rootPath, folderPath);
-					if (relFromFolder === '' || (!relFromFolder.startsWith('..') && !path.isAbsolute(relFromFolder))) {
+					if (isDescendant(folderPath, rootPath) || isDescendant(rootPath, folderPath)) {
 						folderPathOrWorkspaceFile = folderPath;
 						break;
 					}
@@ -78,7 +128,6 @@ export class RepositoryCache {
 		} catch {
 			return;
 		}
-
 	}
 
 	update(addedRemotes: Remote[], removedRemotes: Remote[], rootPath: string): void {
@@ -105,13 +154,15 @@ export class RepositoryCache {
 	/**
 	 * We should possibly support converting between ssh remotes and http remotes.
 	 */
-	get(repoUrl: string): string[] | undefined {
-		const inner = this.lru.get(repoUrl);
-		return inner ? Array.from(inner.keys()) : undefined;
+	get(repoUrl: string): RepositoryCacheInfo[] | undefined {
+		const key = this.normalizeRepoUrl(repoUrl);
+		const inner = this.lru.get(key);
+		return inner ? Array.from(inner.values()) : undefined;
 	}
 
 	delete(repoUrl: string, folderPathOrWorkspaceFile: string) {
-		const inner = this.lru.get(repoUrl);
+		const key = this.normalizeRepoUrl(repoUrl);
+		const inner = this.lru.get(key);
 		if (!inner) {
 			return;
 		}
@@ -119,38 +170,38 @@ export class RepositoryCache {
 			return;
 		}
 		if (inner.size === 0) {
-			this.lru.remove(repoUrl);
+			this.lru.remove(key);
 		} else {
 			// Re-set to bump outer LRU recency after modification
-			this.lru.set(repoUrl, inner);
+			this.lru.set(key, inner);
 		}
 		this.save();
 	}
 
 	private load(): void {
 		try {
-			const raw = this._globalState.get<[string, [string, true][]][]>(RepositoryCache.STORAGE_KEY);
-			if (Array.isArray(raw)) {
-				for (const [repo, storedFolders] of raw) {
-					if (typeof repo !== 'string' || !Array.isArray(storedFolders)) {
+			const raw = this._globalState.get<[string, [string, RepositoryCacheInfo][]][]>(RepositoryCache.STORAGE_KEY);
+			if (!Array.isArray(raw)) {
+				return;
+			}
+			for (const [repo, storedFolders] of raw) {
+				if (typeof repo !== 'string' || !Array.isArray(storedFolders)) {
+					continue;
+				}
+				const inner = new LRUCache<string, RepositoryCacheInfo>(RepositoryCache.MAX_FOLDER_ENTRIES);
+				for (const entry of storedFolders) {
+					if (!Array.isArray(entry) || entry.length !== 2) {
 						continue;
 					}
-					const inner = new LRUCache<string, true>(RepositoryCache.MAX_FOLDER_ENTRIES);
-					for (const entry of storedFolders) {
-						let folderPath: string | undefined;
-						if (Array.isArray(entry) && entry.length === 2) {
-							const [workspaceFolder, _] = entry;
-							if (typeof workspaceFolder === 'string') {
-								folderPath = workspaceFolder;
-							}
-						}
-						if (folderPath) {
-							inner.set(folderPath, true);
-						}
+					const [folderPath, info] = entry;
+					if (typeof folderPath !== 'string' || !isRepositoryCacheInfo(info)) {
+						continue;
 					}
-					if (inner.size) {
-						this.lru.set(repo, inner);
-					}
+
+					inner.set(folderPath, info);
+				}
+				if (inner.size) {
+					this.lru.set(repo, inner);
 				}
 			}
 		} catch {
@@ -159,15 +210,19 @@ export class RepositoryCache {
 	}
 
 	private save(): void {
-		// Serialize as [repoUrl, [folderPathOrWorkspaceFile, true][]] preserving outer LRU order.
-		const serialized: [string, [string, true][]][] = [];
+		// Serialize as [repoUrl, [folderPathOrWorkspaceFile, RepositoryCacheInfo][]] preserving outer LRU order.
+		const serialized: [string, [string, RepositoryCacheInfo][]][] = [];
 		for (const [repo, inner] of this.lru) {
-			const folders: [string, true][] = [];
-			for (const [folder, _] of inner) {
-				folders.push([folder, true]);
+			const folders: [string, RepositoryCacheInfo][] = [];
+			for (const [folder, info] of inner) {
+				folders.push([folder, info]);
 			}
 			serialized.push([repo, folders]);
 		}
 		void this._globalState.update(RepositoryCache.STORAGE_KEY, serialized);
+
+		// Invalidate recent repositories map
+		this._recentRepositories?.clear();
+		this._recentRepositories = undefined;
 	}
 }

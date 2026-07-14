@@ -143,7 +143,7 @@ class DecorationRule {
 			font-size: 16px;
 			margin-right: 14px;
 			font-weight: normal;
-			${modifier === 'spin' ? 'animation: codicon-spin 1.5s steps(30) infinite; font-style: normal !important;' : ''};
+			${modifier === 'spin' ? 'animation: codicon-spin 1.5s steps(30) infinite; font-style: normal !important; transform-origin: center center;' : ''};
 			`,
 			element
 		);
@@ -260,7 +260,7 @@ export class DecorationsService implements IDecorationsService {
 		@IUriIdentityService uriIdentityService: IUriIdentityService,
 		@IThemeService themeService: IThemeService,
 	) {
-		this._decorationStyles = new DecorationStyles(themeService);
+		this._decorationStyles = this._store.add(new DecorationStyles(themeService));
 		this._data = TernarySearchTree.forUris(key => uriIdentityService.extUri.ignorePathCasing(key));
 
 		this._store.add(this._onDidChangeDecorationsDelayed.event(event => { this._onDidChangeDecorations.fire(new FileDecorationChangeEvent(event)); }));

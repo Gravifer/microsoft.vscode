@@ -3,15 +3,22 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { ServicesAccessor } from '../../../../../platform/instantiation/common/instantiation.js';
-import { IChatEditorOptions } from '../chatEditor.js';
-import { ChatEditorInput } from '../chatEditorInput.js';
-import { IEditorService } from '../../../../services/editor/common/editorService.js';
-import { ChatSessionUri } from '../../common/chatUri.js';
+import { Schemas } from '../../../../../base/common/network.js';
 import { generateUuid } from '../../../../../base/common/uuid.js';
+import { ServicesAccessor } from '../../../../../platform/instantiation/common/instantiation.js';
+import { IConfigurationService } from '../../../../../platform/configuration/common/configuration.js';
+import { IStorageService } from '../../../../../platform/storage/common/storage.js';
+import { IEditorService } from '../../../../services/editor/common/editorService.js';
+import { IChatSessionsService } from '../../common/chatSessionsService.js';
+import { getDefaultNewChatSessionResource } from '../../common/constants.js';
+import { IChatEditorOptions } from '../widgetHosts/editor/chatEditor.js';
+import { ChatEditorInput } from '../widgetHosts/editor/chatEditorInput.js';
 
 export async function clearChatEditor(accessor: ServicesAccessor, chatEditorInput?: ChatEditorInput): Promise<void> {
 	const editorService = accessor.get(IEditorService);
+	const configurationService = accessor.get(IConfigurationService);
+	const chatSessionsService = accessor.get(IChatSessionsService);
+	const storageService = accessor.get(IStorageService);
 
 	if (!chatEditorInput) {
 		const editorInput = editorService.activeEditor;
@@ -19,8 +26,11 @@ export async function clearChatEditor(accessor: ServicesAccessor, chatEditorInpu
 	}
 
 	if (chatEditorInput instanceof ChatEditorInput) {
-		const parsedInfo = ChatSessionUri.parse(chatEditorInput.resource);
-		const resource = parsedInfo?.chatSessionType ? ChatSessionUri.forSession(parsedInfo.chatSessionType, `untitled-${generateUuid()}`) : ChatEditorInput.getNewEditorUri();
+		// If we have a contributed session, make sure we create an untitled session for it.
+		// Otherwise create a generic new chat editor.
+		const resource = chatEditorInput.sessionResource && chatEditorInput.sessionResource.scheme !== Schemas.vscodeLocalChatSession
+			? chatEditorInput.sessionResource.with({ path: `/untitled-${generateUuid()}` })
+			: getDefaultNewChatSessionResource(configurationService, chatSessionsService, storageService);
 
 		// A chat editor can only be open in one group
 		const identifier = editorService.findEditors(chatEditorInput.resource)[0];

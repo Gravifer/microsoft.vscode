@@ -66,10 +66,6 @@ export function createExtHostQuickOpen(mainContext: IMainContext, workspace: IEx
 
 			const instance = ++this._instances;
 
-			if (options?.prompt) {
-				checkProposedApiEnabled(extension, 'quickPickPrompt');
-			}
-
 			const quickPickWidget = proxy.$show(instance, {
 				title: options?.title,
 				placeHolder: options?.placeHolder,
@@ -100,10 +96,6 @@ export function createExtHostQuickOpen(mainContext: IMainContext, workspace: IEx
 						} else {
 							if (item.tooltip) {
 								checkProposedApiEnabled(extension, 'quickPickItemTooltip');
-							}
-
-							if (item.resourceUri) {
-								checkProposedApiEnabled(extension, 'quickPickItemResource');
 							}
 
 							pickItems.push({
@@ -260,10 +252,10 @@ export function createExtHostQuickOpen(mainContext: IMainContext, workspace: IEx
 			session?._fireDidTriggerButton(handle, checked);
 		}
 
-		$onDidTriggerItemButton(sessionId: number, itemHandle: number, buttonHandle: number): void {
+		$onDidTriggerItemButton(sessionId: number, itemHandle: number, buttonHandle: number, checked?: boolean): void {
 			const session = this._sessions.get(sessionId);
 			if (session instanceof ExtHostQuickPick) {
-				session._fireDidTriggerItemButton(itemHandle, buttonHandle);
+				session._fireDidTriggerItemButton(itemHandle, buttonHandle, checked);
 			}
 		}
 
@@ -399,9 +391,6 @@ export function createExtHostQuickOpen(mainContext: IMainContext, workspace: IEx
 		}
 
 		set buttons(buttons: QuickInputButton[]) {
-			if (buttons.some(button => button.location || button.checked !== undefined)) {
-				checkProposedApiEnabled(this._extension, 'quickInputButtonLocation');
-			}
 			this._buttons = buttons.slice();
 			this._handlesToButtons.clear();
 			buttons.forEach((button, i) => {
@@ -414,8 +403,8 @@ export function createExtHostQuickOpen(mainContext: IMainContext, workspace: IEx
 						iconPathDto: IconPath.from(button.iconPath),
 						tooltip: button.tooltip,
 						handle: button === QuickInputButtons.Back ? -1 : i,
-						location: button.location,
-						checked: button.checked
+						location: typeof button.location === 'number' ? button.location : undefined,
+						toggle: typeof button.toggle === 'object' && typeof button.toggle.checked === 'boolean' ? { checked: button.toggle.checked } : undefined,
 					};
 				})
 			});
@@ -448,8 +437,8 @@ export function createExtHostQuickOpen(mainContext: IMainContext, workspace: IEx
 		_fireDidTriggerButton(handle: number, checked?: boolean) {
 			const button = this._handlesToButtons.get(handle);
 			if (button) {
-				if (checked !== undefined) {
-					button.checked = checked;
+				if (checked !== undefined && button.toggle) {
+					button.toggle.checked = checked;
 				}
 				this._onDidTriggerButtonEmitter.fire(button);
 			}
@@ -485,7 +474,7 @@ export function createExtHostQuickOpen(mainContext: IMainContext, workspace: IEx
 			proxy.$dispose(this._id);
 		}
 
-		protected update(properties: Record<string, any>): void {
+		protected update(properties: Record<string, unknown>): void {
 			if (this._disposed) {
 				return;
 			}
@@ -565,10 +554,6 @@ export function createExtHostQuickOpen(mainContext: IMainContext, workspace: IEx
 						checkProposedApiEnabled(this._extension, 'quickPickItemTooltip');
 					}
 
-					if (item.resourceUri) {
-						checkProposedApiEnabled(this._extension, 'quickPickItemResource');
-					}
-
 					pickItems.push({
 						handle,
 						label: item.label,
@@ -583,7 +568,11 @@ export function createExtHostQuickOpen(mainContext: IMainContext, workspace: IEx
 							return {
 								iconPathDto: IconPath.from(button.iconPath),
 								tooltip: button.tooltip,
-								handle: i
+								handle: i,
+								toggle:
+									typeof button.toggle === 'object' && typeof button.toggle.checked === 'boolean'
+										? { checked: button.toggle.checked }
+										: undefined,
 							};
 						}),
 					});
@@ -645,7 +634,6 @@ export function createExtHostQuickOpen(mainContext: IMainContext, workspace: IEx
 		}
 
 		set prompt(prompt: string | undefined) {
-			checkProposedApiEnabled(this._extension, 'quickPickPrompt');
 			this._prompt = prompt;
 			this.update({ prompt });
 		}
@@ -686,13 +674,16 @@ export function createExtHostQuickOpen(mainContext: IMainContext, workspace: IEx
 
 		onDidTriggerItemButton = this._onDidTriggerItemButtonEmitter.event;
 
-		_fireDidTriggerItemButton(itemHandle: number, buttonHandle: number) {
+		_fireDidTriggerItemButton(itemHandle: number, buttonHandle: number, checked?: boolean) {
 			const item = this._handlesToItems.get(itemHandle)!;
 			if (!item || !item.buttons || !item.buttons.length) {
 				return;
 			}
 			const button = item.buttons[buttonHandle];
 			if (button) {
+				if (checked !== undefined && button.toggle) {
+					button.toggle.checked = checked;
+				}
 				this._onDidTriggerItemButtonEmitter.fire({
 					button,
 					item
